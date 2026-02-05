@@ -1,0 +1,10 @@
+services:
+  - type: worker
+    name: gapmafia-bot
+    runtime: python
+    pythonVersion: 3.11.8
+    buildCommand: pip install -r requirements.txt
+    startCommand: python mafia_bot.py
+    envVars:
+      - key: TOKEN
+        sync: false
