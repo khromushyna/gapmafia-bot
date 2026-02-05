@@ -54,6 +54,7 @@ PHASE_DAY_DISCUSS = "day_discuss"
 PHASE_DAY_VOTE = "day_vote"
 PHASE_ENDED = "ended"
 
+
 @dataclass
 class Player:
     user_id: int
@@ -61,6 +62,7 @@ class Player:
     role: str = ROLE_CIVILIAN
     alive: bool = True
     opened_dm: bool = False
+
 
 @dataclass
 class Game:
@@ -71,13 +73,14 @@ class Game:
 
     panel_msg_id: Optional[int] = None  # message id панели лобби
 
-    # NIGHT choices
-    mafia_target: Dict[int, int] = field(default_factory=dict)
-    doctor_save: Dict[int, int] = field(default_factory=dict)
-    detective_check: Dict[int, int] = field(default_factory=dict)
+    # NIGHT choices (каждый игрок роли выбирает цель)
+    mafia_target: Dict[int, int] = field(default_factory=dict)     # mafia_id -> target_id
+    doctor_save: Dict[int, int] = field(default_factory=dict)      # doctor_id -> target_id
+    detective_check: Dict[int, int] = field(default_factory=dict)  # detective_id -> target_id
 
     # DAY vote
     day_votes: Dict[int, int] = field(default_factory=dict)  # voter_id -> target_id (0 = skip)
+
 
 GAMES: Dict[int, Game] = {}  # chat_id -> Game
 
@@ -90,19 +93,20 @@ def get_game(chat_id: int) -> Game:
         raise RuntimeError("Game not found. Create one with /newgame")
     return GAMES[chat_id]
 
+
 def deep_link_open_dm(chat_id: int) -> str:
     if not BOT_USERNAME:
         return ""
     return f"https://t.me/{BOT_USERNAME}?start=from_group_{chat_id}"
 
+
 def alive_players(g: Game) -> List[Player]:
     return [p for p in g.players.values() if p.alive]
 
-def living_ids(g: Game) -> List[int]:
-    return [p.user_id for p in alive_players(g)]
 
 def mafia_players(g: Game) -> List[Player]:
     return [p for p in alive_players(g) if p.role == ROLE_MAFIA]
+
 
 def count_roles(g: Game) -> Tuple[int, int, int, int]:
     mafia = sum(1 for p in g.players.values() if p.alive and p.role == ROLE_MAFIA)
@@ -110,6 +114,7 @@ def count_roles(g: Game) -> Tuple[int, int, int, int]:
     det = sum(1 for p in g.players.values() if p.alive and p.role == ROLE_DETECTIVE)
     civ = sum(1 for p in g.players.values() if p.alive and p.role == ROLE_CIVILIAN)
     return mafia, doc, det, civ
+
 
 def game_over_text(g: Game) -> Optional[str]:
     mafia, _, _, _ = count_roles(g)
@@ -121,6 +126,7 @@ def game_over_text(g: Game) -> Optional[str]:
         return "☠️ *Победа мафии!* Город под контролем."
     return None
 
+
 def assign_roles(g: Game):
     ids = list(g.players.keys())
     n = len(ids)
@@ -129,7 +135,7 @@ def assign_roles(g: Game):
     doctor_count = 1 if n >= 5 else 0
     detective_count = 1 if n >= 6 else 0
 
-    pool = []
+    pool: List[str] = []
     pool += [ROLE_MAFIA] * mafia_count
     pool += [ROLE_DOCTOR] * doctor_count
     pool += [ROLE_DETECTIVE] * detective_count
@@ -140,12 +146,23 @@ def assign_roles(g: Game):
     random.shuffle(ids)
     for uid, role in zip(ids, pool):
         g.players[uid].role = role
+        g.players[uid].alive = True
+
+    # сброс выборов
+    g.mafia_target.clear()
+    g.doctor_save.clear()
+    g.detective_check.clear()
+    g.day_votes.clear()
+
 
 def cancel_jobs(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     jq = context.application.job_queue
+    if jq is None:
+        return
     for name in (f"night_{chat_id}", f"day_discuss_{chat_id}", f"day_vote_{chat_id}"):
         for job in jq.get_jobs_by_name(name):
             job.schedule_removal()
+
 
 async def try_dm(context: ContextTypes.DEFAULT_TYPE, user_id: int, text: str, reply_markup=None) -> bool:
     try:
@@ -158,6 +175,33 @@ async def try_dm(context: ContextTypes.DEFAULT_TYPE, user_id: int, text: str, re
         return True
     except Exception:
         return False
+
+
+def tally_day_votes(g: Game) -> Dict[int, int]:
+    counts: Dict[int, int] = {}
+    for voter_id, target_id in g.day_votes.items():
+        if voter_id not in g.players or not g.players[voter_id].alive:
+            continue
+        counts[target_id] = counts.get(target_id, 0) + 1
+    return counts
+
+
+# =========================
+# JOB WRAPPERS (IMPORTANT)
+# =========================
+async def job_resolve_night(context: ContextTypes.DEFAULT_TYPE):
+    chat_id = context.job.data["chat_id"]
+    await resolve_night(context, chat_id, by_timer=True)
+
+
+async def job_begin_day_vote(context: ContextTypes.DEFAULT_TYPE):
+    chat_id = context.job.data["chat_id"]
+    await begin_day_vote(context, chat_id)
+
+
+async def job_resolve_day(context: ContextTypes.DEFAULT_TYPE):
+    chat_id = context.job.data["chat_id"]
+    await resolve_day(context, chat_id, by_timer=True)
 
 
 # =========================
@@ -184,6 +228,7 @@ def kb_lobby(chat_id: int) -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton("🛑 End Game", callback_data=f"END|{chat_id}")])
     return InlineKeyboardMarkup(rows)
 
+
 def kb_day_vote(chat_id: int, g: Game) -> InlineKeyboardMarkup:
     rows = []
     for p in alive_players(g):
@@ -194,6 +239,7 @@ def kb_day_vote(chat_id: int, g: Game) -> InlineKeyboardMarkup:
         InlineKeyboardButton("📌 Status", callback_data=f"STATUS|{chat_id}"),
     ])
     return InlineKeyboardMarkup(rows)
+
 
 def kb_night_targets(chat_id: int, g: Game, action: str, actor_id: int) -> InlineKeyboardMarkup:
     rows = []
@@ -220,6 +266,7 @@ def lobby_text(chat_id: int, g: Game) -> str:
         f"Минимум игроков: *{MIN_PLAYERS}*"
     )
 
+
 def status_text(g: Game) -> str:
     alive = alive_players(g)
     dead = [p for p in g.players.values() if not p.alive]
@@ -234,6 +281,7 @@ def status_text(g: Game) -> str:
         f"*Мёртвые:*\n{dead_str}\n\n"
         f"(живых ролей: мафия {mafia}, доктор {doc}, детектив {det}, мирные {civ})"
     )
+
 
 async def update_lobby_panel(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     g = get_game(chat_id)
@@ -279,6 +327,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Открой личку с ботом и нажми /start (это нужно Telegram’у).")
 
+
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Команды в группе:\n"
@@ -288,6 +337,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Мафия-чат в личке:\n"
         "/mafia текст\n"
     )
+
 
 async def cmd_newgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
@@ -309,6 +359,7 @@ async def cmd_newgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     g.panel_msg_id = msg.message_id
 
+
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     if chat.id not in GAMES:
@@ -316,6 +367,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     g = get_game(chat.id)
     await update.message.reply_text(status_text(g), parse_mode=ParseMode.MARKDOWN)
+
 
 async def cmd_endgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
@@ -325,6 +377,7 @@ async def cmd_endgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cancel_jobs(context, chat.id)
     del GAMES[chat.id]
     await update.message.reply_text("🛑 Игра завершена.")
+
 
 async def cmd_mafia(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Мафия-чат: /mafia message — разошлём всем живым мафиям (в личку)."""
@@ -339,7 +392,6 @@ async def cmd_mafia(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Напиши так: `/mafia текст`", parse_mode=ParseMode.MARKDOWN)
         return
 
-    # ищем игру, где этот user является мафией
     for g in GAMES.values():
         if user.id in g.players and g.players[user.id].alive and g.players[user.id].role == ROLE_MAFIA:
             mafias = mafia_players(g)
@@ -351,6 +403,29 @@ async def cmd_mafia(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     await update.message.reply_text("Ты не мафия (или нет активной игры).")
+
+
+# =========================
+# OPTIONAL: “обычный текст” от мафии (в личке) тоже работает как чат
+# =========================
+async def on_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    if chat.type != ChatType.PRIVATE:
+        return
+    user = update.effective_user
+    txt = (update.message.text or "").strip()
+    if not txt:
+        return
+
+    for g in GAMES.values():
+        if user.id in g.players and g.players[user.id].alive and g.players[user.id].role == ROLE_MAFIA:
+            mafias = mafia_players(g)
+            for p in mafias:
+                if p.user_id == user.id:
+                    continue
+                await try_dm(context, p.user_id, f"💬 *Мафия-чат:* {g.players[user.id].name}: {txt}")
+            await update.message.reply_text("✅ Отправлено мафии. (Можно и /mafia текст)")
+            return
 
 
 # =========================
@@ -370,7 +445,6 @@ async def start_game(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
 
     cancel_jobs(context, chat_id)
 
-    # красивое сообщение
     await context.bot.send_message(
         chat_id=chat_id,
         text=(
@@ -382,7 +456,6 @@ async def start_game(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
         parse_mode=ParseMode.MARKDOWN,
     )
 
-    # каждому игроку: роль
     role_text_map = {
         ROLE_MAFIA: "☠️ *Ты МАФИЯ.* Выбирай жертву этой ночью.",
         ROLE_DOCTOR: "🩺 *Ты ДОКТОР.* Выбирай, кого спасти.",
@@ -390,7 +463,6 @@ async def start_game(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
         ROLE_CIVILIAN: "🙂 *Ты МИРНЫЙ.* Ночью ты спишь.",
     }
 
-    # отправим мафии список мафии (“мафия чат”)
     mafias = mafia_players(g)
     mafia_names = ", ".join(p.name for p in mafias) if mafias else ""
     mafia_tip = (
@@ -406,13 +478,8 @@ async def start_game(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
         )
         p.opened_dm = ok or p.opened_dm
 
-    # мафии — дополнительно покажем “кто мафия”
     for p in mafias:
-        await try_dm(
-            context,
-            p.user_id,
-            f"🤝 *Вы мафия.* Состав мафии: *{mafia_names}*{mafia_tip}",
-        )
+        await try_dm(context, p.user_id, f"🤝 *Вы мафия.* Состав мафии: *{mafia_names}*{mafia_tip}")
 
     # ночные кнопки
     for p in alive_players(g):
@@ -423,12 +490,16 @@ async def start_game(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
         elif p.role == ROLE_DETECTIVE:
             await try_dm(context, p.user_id, "Кого проверяем этой ночью?", reply_markup=kb_night_targets(chat_id, g, "DETCHECK", p.user_id))
 
-    # таймер ночи: авто-резолв
-    context.application.job_queue.run_once(
-        lambda ctx: resolve_night(ctx, chat_id, by_timer=True),
-        when=NIGHT_SECONDS,
-        name=f"night_{chat_id}",
-    )
+    # таймер ночи
+    jq = context.application.job_queue
+    if jq is not None:
+        jq.run_once(
+            job_resolve_night,
+            when=NIGHT_SECONDS,
+            name=f"night_{chat_id}",
+            data={"chat_id": chat_id},
+        )
+
 
 async def begin_day_discuss(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     g = get_game(chat_id)
@@ -447,12 +518,15 @@ async def begin_day_discuss(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
         parse_mode=ParseMode.MARKDOWN,
     )
 
-    # таймер обсуждения -> открыть голосование
-    context.application.job_queue.run_once(
-        lambda ctx: begin_day_vote(ctx, chat_id),
-        when=DAY_DISCUSS_SECONDS,
-        name=f"day_discuss_{chat_id}",
-    )
+    jq = context.application.job_queue
+    if jq is not None:
+        jq.run_once(
+            job_begin_day_vote,
+            when=DAY_DISCUSS_SECONDS,
+            name=f"day_discuss_{chat_id}",
+            data={"chat_id": chat_id},
+        )
+
 
 async def begin_day_vote(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     g = get_game(chat_id)
@@ -471,12 +545,15 @@ async def begin_day_vote(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
         parse_mode=ParseMode.MARKDOWN,
     )
 
-    # таймер голосования -> авто-итог
-    context.application.job_queue.run_once(
-        lambda ctx: resolve_day(ctx, chat_id, by_timer=True),
-        when=DAY_VOTE_SECONDS,
-        name=f"day_vote_{chat_id}",
-    )
+    jq = context.application.job_queue
+    if jq is not None:
+        jq.run_once(
+            job_resolve_day,
+            when=DAY_VOTE_SECONDS,
+            name=f"day_vote_{chat_id}",
+            data={"chat_id": chat_id},
+        )
+
 
 async def resolve_night(context: ContextTypes.DEFAULT_TYPE, chat_id: int, by_timer: bool = False):
     if chat_id not in GAMES:
@@ -487,19 +564,25 @@ async def resolve_night(context: ContextTypes.DEFAULT_TYPE, chat_id: int, by_tim
 
     cancel_jobs(context, chat_id)
 
+    # majority for mafia
     victim_id: Optional[int] = None
     if g.mafia_target:
         counts: Dict[int, int] = {}
         for _, target in g.mafia_target.items():
             counts[target] = counts.get(target, 0) + 1
-        victim_id = max(counts.items(), key=lambda x: x[1])[0]
+        # если ничья среди целей мафии — выберем случайно из топа
+        mx = max(counts.values())
+        top = [tid for tid, v in counts.items() if v == mx]
+        victim_id = random.choice(top)
 
     saved_id: Optional[int] = None
     if g.doctor_save:
         counts: Dict[int, int] = {}
         for _, target in g.doctor_save.items():
             counts[target] = counts.get(target, 0) + 1
-        saved_id = max(counts.items(), key=lambda x: x[1])[0]
+        mx = max(counts.values())
+        top = [tid for tid, v in counts.items() if v == mx]
+        saved_id = random.choice(top)
 
     # детектив — ответы в личку
     if g.detective_check:
@@ -508,15 +591,11 @@ async def resolve_night(context: ContextTypes.DEFAULT_TYPE, chat_id: int, by_tim
             is_mafia = "ДА" if target_role == ROLE_MAFIA else "НЕТ"
             await try_dm(context, det_id, f"🕵️ Проверка: *{g.players[target_id].name}* — мафия? *{is_mafia}*")
 
-    # итог ночи
     night_note = "⏰ Ночь закончилась по таймеру." if by_timer else "✅ Ночь закончилась."
     await context.bot.send_message(chat_id=chat_id, text=night_note)
 
     if victim_id is None:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text="🌫️ Ночь прошла тихо... Никто не был выбран.",
-        )
+        await context.bot.send_message(chat_id=chat_id, text="🌫️ Ночь прошла тихо... Никого не выбрали.")
     else:
         if saved_id == victim_id:
             await context.bot.send_message(
@@ -545,6 +624,7 @@ async def resolve_night(context: ContextTypes.DEFAULT_TYPE, chat_id: int, by_tim
 
     await begin_day_discuss(context, chat_id)
 
+
 async def resolve_day(context: ContextTypes.DEFAULT_TYPE, chat_id: int, by_timer: bool = False):
     if chat_id not in GAMES:
         return
@@ -554,11 +634,8 @@ async def resolve_day(context: ContextTypes.DEFAULT_TYPE, chat_id: int, by_timer
 
     cancel_jobs(context, chat_id)
 
-    counts: Dict[int, int] = {}
-    for voter_id, target_id in g.day_votes.items():
-        if voter_id not in g.players or not g.players[voter_id].alive:
-            continue
-        counts[target_id] = counts.get(target_id, 0) + 1
+    counts = tally_day_votes(g)
+    alive_count = len([p for p in g.players.values() if p.alive])
 
     vote_note = "⏰ Голосование завершилось по таймеру." if by_timer else "✅ Голосование завершено."
     await context.bot.send_message(chat_id=chat_id, text=vote_note)
@@ -566,17 +643,36 @@ async def resolve_day(context: ContextTypes.DEFAULT_TYPE, chat_id: int, by_timer
     if not counts:
         await context.bot.send_message(chat_id=chat_id, text="Пустой суд. Никого не казнили.")
     else:
-        target_id, votes = max(counts.items(), key=lambda x: x[1])
-        if target_id == 0:
-            await context.bot.send_message(chat_id=chat_id, text="⏭️ Большинство пропустило. Сегодня без казни.")
+        sorted_items = sorted(counts.items(), key=lambda x: x[1], reverse=True)
+        top_target, top_votes = sorted_items[0]
+        tied = [tid for tid, v in sorted_items if v == top_votes]
+
+        if len(tied) > 1:
+            lines = ["⚖️ Ничья. Сегодня никто не казнён.", "", "📊 Итоги голосования:"]
+            for tid, v in sorted_items:
+                label = "Skip" if tid == 0 else g.players.get(tid).name if tid in g.players else str(tid)
+                lines.append(f"• {label}: {v}")
+            await context.bot.send_message(chat_id=chat_id, text="\n".join(lines))
         else:
-            if target_id in g.players and g.players[target_id].alive:
-                g.players[target_id].alive = False
+            if top_target == 0:
                 await context.bot.send_message(
                     chat_id=chat_id,
-                    text=f"⚖️ Приговор вынесен… Казнили: *{g.players[target_id].name}* ☠️",
-                    parse_mode=ParseMode.MARKDOWN,
+                    text=f"⏭️ Большинство пропустило. Сегодня без казни. (Skip: {top_votes}/{alive_count})"
                 )
+            else:
+                if top_target in g.players and g.players[top_target].alive:
+                    g.players[top_target].alive = False
+
+                lines = [
+                    f"⚖️ Приговор вынесен… Казнили: *{g.players[top_target].name}* ☠️",
+                    "",
+                    "📊 Итоги голосования:"
+                ]
+                for tid, v in sorted_items:
+                    label = "Skip" if tid == 0 else g.players.get(tid).name if tid in g.players else str(tid)
+                    lines.append(f"• {label}: {v}")
+
+                await context.bot.send_message(chat_id=chat_id, text="\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
     end = game_over_text(g)
     if end:
@@ -597,7 +693,6 @@ async def resolve_day(context: ContextTypes.DEFAULT_TYPE, chat_id: int, by_timer
         parse_mode=ParseMode.MARKDOWN,
     )
 
-    # разошлём ночные кнопки снова
     for p in alive_players(g):
         if p.role == ROLE_MAFIA:
             await try_dm(context, p.user_id, "Выбери жертву:", reply_markup=kb_night_targets(chat_id, g, "MAFIAKILL", p.user_id))
@@ -606,12 +701,14 @@ async def resolve_day(context: ContextTypes.DEFAULT_TYPE, chat_id: int, by_timer
         elif p.role == ROLE_DETECTIVE:
             await try_dm(context, p.user_id, "Кого проверяем этой ночью?", reply_markup=kb_night_targets(chat_id, g, "DETCHECK", p.user_id))
 
-    # таймер ночи
-    context.application.job_queue.run_once(
-        lambda ctx: resolve_night(ctx, chat_id, by_timer=True),
-        when=NIGHT_SECONDS,
-        name=f"night_{chat_id}",
-    )
+    jq = context.application.job_queue
+    if jq is not None:
+        jq.run_once(
+            job_resolve_night,
+            when=NIGHT_SECONDS,
+            name=f"night_{chat_id}",
+            data={"chat_id": chat_id},
+        )
 
 
 # =========================
@@ -725,16 +822,27 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if g.phase != PHASE_DAY_VOTE:
                 await q.answer("Сейчас не время голосования.", show_alert=True)
                 return
+
             target_id = int(parts[2])
+
             if uid not in g.players or not g.players[uid].alive:
                 await q.answer("Ты не живой игрок.", show_alert=True)
                 return
+
             if target_id != 0 and (target_id not in g.players or not g.players[target_id].alive):
                 await q.answer("Цель недоступна.", show_alert=True)
                 return
 
+            # записываем / перезаписываем голос (последний учитывается)
             g.day_votes[uid] = target_id
             await q.answer("Голос принят ✅", show_alert=True)
+
+            # авто-окончание: если все живые проголосовали
+            alive_ids = [p.user_id for p in alive_players(g)]
+            if alive_ids and all(pid in g.day_votes for pid in alive_ids):
+                await context.bot.send_message(chat_id=chat_id, text="✅ Все живые проголосовали. Завершаю голосование.")
+                await resolve_day(context, chat_id, by_timer=False)
+
             return
 
         if action == "ENDVOTE":
@@ -800,7 +908,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             g.detective_check[uid] = target_id
             await q.edit_message_text(f"🕵️ Проверяем: *{g.players[target_id].name}*", parse_mode=ParseMode.MARKDOWN)
 
-        # если все нужные роли сделали выбор — можно завершить ночь раньше
+        # раннее завершение ночи, если все роли выбрали
         mafia_ids = [p.user_id for p in alive_players(g) if p.role == ROLE_MAFIA]
         doc_ids = [p.user_id for p in alive_players(g) if p.role == ROLE_DOCTOR]
         det_ids = [p.user_id for p in alive_players(g) if p.role == ROLE_DETECTIVE]
@@ -816,30 +924,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================
-# OPTIONAL: “обычный текст” от мафии (в личке) тоже работает как чат
-# =========================
-async def on_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    if chat.type != ChatType.PRIVATE:
-        return
-    user = update.effective_user
-    txt = (update.message.text or "").strip()
-    if not txt:
-        return
-
-    # если мафия просто написала сообщение (без /mafia), мы тоже разошлём
-    for g in GAMES.values():
-        if user.id in g.players and g.players[user.id].alive and g.players[user.id].role == ROLE_MAFIA:
-            mafias = mafia_players(g)
-            for p in mafias:
-                if p.user_id == user.id:
-                    continue
-                await try_dm(context, p.user_id, f"💬 *Мафия-чат:* {g.players[user.id].name}: {txt}")
-            await update.message.reply_text("✅ Отправлено мафии. (Можно и /mafia текст)")
-            return
-
-
-# =========================
 # MAIN
 # =========================
 def main():
@@ -851,7 +935,6 @@ def main():
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("endgame", cmd_endgame))
 
-    # мафия-чат
     app.add_handler(CommandHandler("mafia", cmd_mafia))
     app.add_handler(MessageHandler(filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND, on_private_text))
 
@@ -859,6 +942,7 @@ def main():
 
     logger.info("GAP Mafia bot started")
     app.run_polling(allowed_updates=Update.ALL_TYPES, close_loop=False)
+
 
 if __name__ == "__main__":
     main()
